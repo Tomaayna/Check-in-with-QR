@@ -44,31 +44,37 @@
 <script>
 /* ============================================================
  *  受付スキャン画面(GitHub Pages版)
- *  GASウェブアプリのURLは、次の3通りの方法で設定できます(上から優先):
- *   1. URLのクエリパラメータで渡す
- *      例: scan.html?api=https://script.google.com/macros/s/XXXX/exec
- *      (一度開くとこの端末に保存され、次回からは ?api= なしでもOK)
- *   2. 画面の入力欄に貼り付けて保存(端末のlocalStorageに記憶)
- *   3. 下の API_URL に直接書く
+ *  通常は管理トップ画面の「受付スキャン」ボタンから開きます。
+ *  その際 GAS が ?api=ウェブアプリURL&key=合言葉 を付けて遷移するため、
+ *  このファイル(public)にウェブアプリURLを直接書く必要はありません。
+ *  一度開くと api/key はこの端末に保存され、次回はパラメータ無しでも動きます。
  * ============================================================ */
 var API_URL = ""; // ← ここにGASのウェブアプリURL(…/exec)を貼り付けてもOK
+var ADMIN_KEY = "tomasei-nasta-404510"; // 管理用の合言葉(?key= で渡される)
 
-// 優先順位: ①URLの ?api= パラメータ → ②保存済み(localStorage) → ③上の直書き
+// 優先順位: ①URLの ?api=/?key= パラメータ → ②保存済み(localStorage) → ③上の直書き
 (function () {
-  // ① URLクエリ ?api=... を読み取る(encodeURIComponentされていても素のままでもOK)
+  // ① URLクエリ ?api= / ?key= を読み取る
   try {
     var params = new URLSearchParams(window.location.search);
     var fromQuery = params.get("api");
+    var keyQuery  = params.get("key");
     if (fromQuery) {
       API_URL = fromQuery.trim();
-      // 次回以降この端末で開いたとき用に保存
       try { localStorage.setItem("checkin_api_url", API_URL); } catch (e) {}
-      return;
     }
+    if (keyQuery) {
+      ADMIN_KEY = keyQuery.trim();
+      try { localStorage.setItem("checkin_admin_key", ADMIN_KEY); } catch (e) {}
+    }
+    if (fromQuery) return; // api が来ていれば設定完了
   } catch (e) {}
-  // ② 保存済みURLがあれば利用
+  // ② 保存済みがあれば利用
   if (!API_URL) {
     try { API_URL = localStorage.getItem("checkin_api_url") || ""; } catch (e) {}
+  }
+  if (!ADMIN_KEY) {
+    try { ADMIN_KEY = localStorage.getItem("checkin_admin_key") || ""; } catch (e) {}
   }
 })();
 
@@ -76,6 +82,7 @@ var lastId = "", lastTime = 0, scanner = null;
 
 /* GASへのPOST: CORSプリフライトを避けるため text/plain で送る */
 function callApi(body) {
+  body.key = ADMIN_KEY; // 合言葉を付与
   return fetch(API_URL, {
     method: "POST",
     headers: { "Content-Type": "text/plain;charset=utf-8" },
@@ -83,13 +90,18 @@ function callApi(body) {
   }).then(function (r) { return r.json(); });
 }
 
+// stats オブジェクトでカウンター表示を更新
+function updateCounter(stats) {
+  if (!stats) return;
+  document.getElementById("cdone").textContent = stats.done;
+  document.getElementById("ctotal").textContent = stats.total;
+}
+
+// 初回のみカウンターを取得(以降は checkin のレスポンスで更新するため定期取得しない)
 function refresh() {
   if (!API_URL) return;
   callApi({ action: "stats" }).then(function (d) {
-    if (d && d.ok) {
-      document.getElementById("cdone").textContent = d.stats.done;
-      document.getElementById("ctotal").textContent = d.stats.total;
-    }
+    if (d && d.ok) updateCounter(d.stats);
   }).catch(function () {});
 }
 
@@ -116,7 +128,10 @@ function onScan(text) {
   lastId = id; lastTime = now;
 
   callApi({ action: "checkin", id: id }).then(function (d) {
-    if (d && d.result) { show(d.result); refresh(); }
+    if (d && d.result) {
+      show(d.result);
+      updateCounter(d.stats); // checkinのレスポンスに含まれる集計でカウンター更新
+    }
   }).catch(function (e) {
     show({ type: "error", title: "通信エラー", message: "サーバーに接続できません", name: "", company: "" });
   });
@@ -191,14 +206,12 @@ function boot() {
       try { localStorage.setItem("checkin_api_url", v); } catch (e) {}
       document.getElementById("setup").style.display = "none";
       startScanner();
-      refresh();
-      setInterval(refresh, 15000);
+      refresh(); // 初回カウンター取得のみ
     };
     return;
   }
   startScanner();
-  refresh();
-  setInterval(refresh, 15000);
+  refresh(); // 初回カウンター取得のみ(以降はスキャン毎に更新)
 }
 
 boot();
