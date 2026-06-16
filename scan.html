@@ -132,8 +132,8 @@ function tone(freq, start, dur, vol) {
   osc.start(t0);
   osc.stop(t0 + dur + 0.02);
 }
-// 成功音「ピロー↑ン」: 2音上昇
-function beepOk()   { initAudio(); tone(880, 0, 0.12, 0.3); tone(1318, 0.10, 0.22, 0.3); }
+// 成功音「ピロー↑ン」: 2音上昇、合計約1秒
+function beepOk()   { initAudio(); tone(880, 0, 0.3, 0.3); tone(1318, 0.28, 0.72, 0.3); }
 // 警告音(受付済み): 低めの2連
 function beepWarn() { initAudio(); tone(660, 0, 0.12, 0.25); tone(660, 0.16, 0.12, 0.25); }
 // エラー音: 下降
