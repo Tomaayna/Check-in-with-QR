@@ -44,15 +44,33 @@
 <script>
 /* ============================================================
  *  受付スキャン画面(GitHub Pages版)
- *  GASウェブアプリのURLを下の API_URL に直接書いてもよいし、
- *  空のままにすると画面で入力・保存できます(端末に記憶)。
+ *  GASウェブアプリのURLは、次の3通りの方法で設定できます(上から優先):
+ *   1. URLのクエリパラメータで渡す
+ *      例: scan.html?api=https://script.google.com/macros/s/XXXX/exec
+ *      (一度開くとこの端末に保存され、次回からは ?api= なしでもOK)
+ *   2. 画面の入力欄に貼り付けて保存(端末のlocalStorageに記憶)
+ *   3. 下の API_URL に直接書く
  * ============================================================ */
-var API_URL = ""; // ← ここにGASのウェブアプリURL(…/exec)を貼り付けてもOKだが、ページ公開のため設定しない
+var API_URL = ""; // ← ここにGASのウェブアプリURL(…/exec)を貼り付けてもOK
 
-// 保存済みURLがあれば利用
-if (!API_URL) {
-  try { API_URL = localStorage.getItem("checkin_api_url") || ""; } catch (e) {}
-}
+// 優先順位: ①URLの ?api= パラメータ → ②保存済み(localStorage) → ③上の直書き
+(function () {
+  // ① URLクエリ ?api=... を読み取る(encodeURIComponentされていても素のままでもOK)
+  try {
+    var params = new URLSearchParams(window.location.search);
+    var fromQuery = params.get("api");
+    if (fromQuery) {
+      API_URL = fromQuery.trim();
+      // 次回以降この端末で開いたとき用に保存
+      try { localStorage.setItem("checkin_api_url", API_URL); } catch (e) {}
+      return;
+    }
+  } catch (e) {}
+  // ② 保存済みURLがあれば利用
+  if (!API_URL) {
+    try { API_URL = localStorage.getItem("checkin_api_url") || ""; } catch (e) {}
+  }
+})();
 
 var lastId = "", lastTime = 0, scanner = null;
 
