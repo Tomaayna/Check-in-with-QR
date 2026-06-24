@@ -83,7 +83,7 @@ var ADMIN_KEY = "tomasei-nasta-404510"; // 管理用の合言葉(?key= で渡さ
   }
 })();
 
-var lastId = "", lastTime = 0;
+var lastId = "";
 
 /* GASへのPOST: CORSプリフライトを避けるため text/plain で送る */
 function callApi(body) {
@@ -172,7 +172,6 @@ function show(res) {
 }
 
 function onScan(text) {
-  var now = Date.now();
   var id = text;
   // QRに ?id=XXX 入りURLが入っている場合はIDだけ取り出す
   try {
@@ -180,9 +179,10 @@ function onScan(text) {
       id = decodeURIComponent(text.split("?id=")[1].split("&")[0]);
     }
   } catch (e) {}
-  // 同一IDの連続読み取りを1秒間抑止
-  if (id === lastId && now - lastTime < 3000) return;
-  lastId = id; lastTime = now;
+  // 同じQRが映り続けている間は1回だけ処理。
+  // QRが一度画面から外れる(handleRawでlastIDがクリアされる)と再び処理可能。
+  if (id === lastId) return;
+  lastId = id;
 
   callApi({ action: "checkin", id: id }).then(function (d) {
     if (d && d.result) {
@@ -260,8 +260,17 @@ function startScanner() {
 }
 
 // 検出した生テキストを確定処理へ(誤読防止: 同一値2回連続で確定)
+// QRが画面から外れる(一定フレームQR無し)と、再び同じQRを処理可能にする
+var noQrFrames = 0;
 function handleRaw(text) {
-  if (!text) { pendingVal = ""; pendingCount = 0; return; }
+  if (!text) {
+    pendingVal = ""; pendingCount = 0;
+    noQrFrames++;
+    // 連続でQRが見えなくなったら「外れた」とみなし、直前ID記憶をクリア
+    if (noQrFrames >= 8) { lastId = ""; }
+    return;
+  }
+  noQrFrames = 0;
   if (text === pendingVal) {
     pendingCount++;
   } else {
