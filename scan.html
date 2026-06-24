@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>受付スキャン</title>
-<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
 <style>
   * { box-sizing: border-box; }
   body { margin: 0; font-family: sans-serif; background: #0d1b2a; color: #fff; }
@@ -49,10 +49,10 @@
  *  このファイル(public)にウェブアプリURLを直接書く必要はありません。
  *  一度開くと api/key はこの端末に保存され、次回はパラメータ無しでも動きます。
  *
- *  【QR認識精度について】
- *  ネイティブの BarcodeDetector API が使える端末(iOS16+ Safari等)では
- *  そちらを優先し、標準カメラアプリ並みの高精度・高速検出を行う。
- *  非対応端末は html5-qrcode にフォールバック(高解像度・fps15で起動)。
+ *  【QR認識について】
+ *  ネイティブの BarcodeDetector が使える端末ではそちらを優先。
+ *  非対応端末は jsQR(QR専用デコーダ)で読み取る。
+ *  いずれも同一値を2フレーム連続で読めたら確定する誤読防止つき。
  * ============================================================ */
 var API_URL = ""; // ← ここにGASのウェブアプリURL(…/exec)を貼り付けてもOK
 var ADMIN_KEY = "tomasei-nasta-404510"; // 管理用の合言葉(?key= で渡される)
@@ -83,7 +83,7 @@ var ADMIN_KEY = "tomasei-nasta-404510"; // 管理用の合言葉(?key= で渡さ
   }
 })();
 
-var lastId = "", lastTime = 0, scanner = null;
+var lastId = "", lastTime = 0;
 
 /* GASへのPOST: CORSプリフライトを避けるため text/plain で送る */
 function callApi(body) {
@@ -95,14 +95,28 @@ function callApi(body) {
   }).then(function (r) { return r.json(); });
 }
 
-// stats オブジェクトでカウンター表示を更新
-function updateCounter(stats) {
-  if (!stats) return;
-  document.getElementById("cdone").textContent = stats.done;
-  document.getElementById("ctotal").textContent = stats.total;
+// カウンター値を手元で保持(checkin応答に集計を含めない分、ここで管理)
+var cntDone = null, cntTotal = null;
+
+function renderCounter() {
+  document.getElementById("cdone").textContent = (cntDone === null ? "-" : cntDone);
+  document.getElementById("ctotal").textContent = (cntTotal === null ? "-" : cntTotal);
 }
 
-// 初回のみカウンターを取得(以降は checkin のレスポンスで更新するため定期取得しない)
+// stats オブジェクトでカウンター表示を初期化/再同期
+function updateCounter(stats) {
+  if (!stats) return;
+  cntDone = stats.done;
+  cntTotal = stats.total;
+  renderCounter();
+}
+
+// 受付成功時に手元で来場数を+1(サーバーへの集計問い合わせをしない)
+function incCounter() {
+  if (cntDone !== null) { cntDone++; renderCounter(); }
+}
+
+// 初回のみカウンターを取得(以降は成功ごとに手元で+1)
 function refresh() {
   if (!API_URL) return;
   callApi({ action: "stats" }).then(function (d) {
@@ -166,14 +180,14 @@ function onScan(text) {
       id = decodeURIComponent(text.split("?id=")[1].split("&")[0]);
     }
   } catch (e) {}
-  // 同一IDの連続読み取りを3秒間抑止
+  // 同一IDの連続読み取りを1秒間抑止
   if (id === lastId && now - lastTime < 1000) return;
   lastId = id; lastTime = now;
 
   callApi({ action: "checkin", id: id }).then(function (d) {
     if (d && d.result) {
       show(d.result);
-      updateCounter(d.stats); // checkinのレスポンスに含まれる集計でカウンター更新
+      if (d.result.type === "ok") incCounter(); // 新規受付のみ来場数を+1
     }
   }).catch(function (e) {
     show({ type: "error", title: "通信エラー", message: "サーバーに接続できません", name: "", company: "" });
@@ -196,107 +210,103 @@ function showError(name, detail) {
   document.getElementById("retry").onclick = startScanner;
 }
 
+/* ===== カメラ起動 → BarcodeDetector優先、なければjsQR ===== */
+var camVideo = null, camStream = null, scanRAF = null, canvas = null, cctx = null;
+var pendingVal = "", pendingCount = 0; // 誤読防止: 同一値が2フレーム連続で確定
+
 function startScanner() {
-  initAudio(); // iOS対策: ユーザー操作に連なるこのタイミングで音声を有効化
+  initAudio();
   document.getElementById("err").style.display = "none";
   document.getElementById("result").textContent = "カメラを起動しています…";
-  // ネイティブの BarcodeDetector が使えるならそちらを優先(標準カメラ並みの精度)
-  if ("BarcodeDetector" in window) {
-    startNativeDetector();
+  // 再試行などで二重起動しないよう、既存のカメラ/ループを停止
+  if (scanRAF) { cancelAnimationFrame(scanRAF); scanRAF = null; }
+  if (camStream) { camStream.getTracks().forEach(function (t) { t.stop(); }); camStream = null; }
+  pendingVal = ""; pendingCount = 0;
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    showError("Error", "このブラウザはカメラに対応していません");
     return;
   }
-  // 非対応端末は html5-qrcode にフォールバック
-  if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
-    navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } })
-      .then(function (stream) {
-        stream.getTracks().forEach(function (t) { t.stop(); });
-        launchScanner();
-      })
-      .catch(function (e) { showError(e.name || "Error", e.message || e); });
+  navigator.mediaDevices.getUserMedia({
+    video: { facingMode: "environment", width: { ideal: 1280 }, height: { ideal: 1280 } }
+  }).then(function (stream) {
+    camStream = stream;
+    var reader = document.getElementById("reader");
+    reader.innerHTML = "";
+    camVideo = document.createElement("video");
+    camVideo.setAttribute("playsinline", "true"); // iOSで全画面化させない
+    camVideo.muted = true;
+    camVideo.style.width = "100%";
+    camVideo.srcObject = stream;
+    reader.appendChild(camVideo);
+    return camVideo.play();
+  }).then(function () {
+    document.getElementById("result").textContent = "QRコードをカメラにかざしてください";
+    // BarcodeDetectorが実際にqr_codeをサポートしていれば優先
+    if ("BarcodeDetector" in window && BarcodeDetector.getSupportedFormats) {
+      BarcodeDetector.getSupportedFormats().then(function (fmts) {
+        if (fmts.indexOf("qr_code") >= 0) {
+          runNative();
+        } else {
+          runJsQR();
+        }
+      }).catch(function () { runJsQR(); });
+    } else {
+      runJsQR();
+    }
+  }).catch(function (e) {
+    showError(e.name || "Error", e.message || e);
+  });
+}
+
+// 検出した生テキストを確定処理へ(誤読防止: 同一値2回連続で確定)
+function handleRaw(text) {
+  if (!text) { pendingVal = ""; pendingCount = 0; return; }
+  if (text === pendingVal) {
+    pendingCount++;
   } else {
-    launchScanner();
+    pendingVal = text; pendingCount = 1;
+  }
+  if (pendingCount >= 2) {   // 2フレーム連続で同じ値なら確定
+    pendingVal = ""; pendingCount = 0;
+    onScan(text);
   }
 }
 
-/* ===== ネイティブ BarcodeDetector による高精度スキャン ===== */
-var nativeVideo = null, nativeStream = null, nativeRAF = null;
-function startNativeDetector() {
+// ネイティブ BarcodeDetector で走査
+function runNative() {
   var detector;
-  try {
-    detector = new BarcodeDetector({ formats: ["qr_code"] });
-  } catch (e) { launchScanner(); return; }
-
-  navigator.mediaDevices.getUserMedia({
-    video: { facingMode: "environment", width: { ideal: 1920 }, height: { ideal: 1080 } }
-  }).then(function (stream) {
-    nativeStream = stream;
-    var reader = document.getElementById("reader");
-    reader.innerHTML = "";
-    nativeVideo = document.createElement("video");
-    nativeVideo.setAttribute("playsinline", "true"); // iOSで全画面化させない
-    nativeVideo.setAttribute("muted", "true");
-    nativeVideo.style.width = "100%";
-    nativeVideo.srcObject = stream;
-    reader.appendChild(nativeVideo);
-    return nativeVideo.play();
-  }).then(function () {
-    document.getElementById("result").textContent = "QRコードをカメラにかざしてください";
-    var scanning = true;
-    function loop() {
-      if (!scanning) return;
-      detector.detect(nativeVideo).then(function (codes) {
-        if (codes && codes.length) {
-          onScan(codes[0].rawValue);
-        }
-      }).catch(function () {}).then(function () {
-        nativeRAF = requestAnimationFrame(loop);
-      });
-    }
-    loop();
-  }).catch(function (e) {
-    // ネイティブ起動失敗 → html5-qrcode にフォールバック
-    if (nativeStream) { nativeStream.getTracks().forEach(function (t) { t.stop(); }); nativeStream = null; }
-    if (e && (e.name === "NotAllowedError" || e.name === "NotFoundError" || e.name === "NotReadableError")) {
-      showError(e.name, e.message || e);
-    } else {
-      launchScanner();
-    }
-  });
+  try { detector = new BarcodeDetector({ formats: ["qr_code"] }); }
+  catch (e) { runJsQR(); return; }
+  function loop() {
+    detector.detect(camVideo).then(function (codes) {
+      if (codes && codes.length) handleRaw(codes[0].rawValue);
+    }).catch(function () {}).then(function () {
+      scanRAF = requestAnimationFrame(loop);
+    });
+  }
+  loop();
 }
 
-function launchScanner() {
-  if (!scanner) scanner = new Html5Qrcode("reader");
-  // 高精度設定: qrboxを設けず映像全体を走査、fps向上、背面カメラを高解像度で要求
-  var config = {
-    fps: 15,
-    aspectRatio: 1.0,
-    videoConstraints: {
-      facingMode: "environment",
-      width:  { ideal: 1920 },
-      height: { ideal: 1080 }
+// jsQR で走査(canvasに描画してピクセルを解析)
+function runJsQR() {
+  canvas = document.createElement("canvas");
+  cctx = canvas.getContext("2d", { willReadFrequently: true });
+  function loop() {
+    if (camVideo.readyState === camVideo.HAVE_ENOUGH_DATA && camVideo.videoWidth) {
+      var w = camVideo.videoWidth, h = camVideo.videoHeight;
+      // 解析負荷軽減のため最大640pxに縮小して読む
+      var scale = Math.min(1, 640 / Math.max(w, h));
+      var cw = Math.round(w * scale), ch = Math.round(h * scale);
+      canvas.width = cw; canvas.height = ch;
+      cctx.drawImage(camVideo, 0, 0, cw, ch);
+      var img = cctx.getImageData(0, 0, cw, ch);
+      var code = jsQR(img.data, cw, ch, { inversionAttempts: "dontInvert" });
+      if (code && code.data) handleRaw(code.data);
     }
-  };
-  scanner.start(
-    { facingMode: "environment" },
-    config,
-    onScan, function () {}
-  ).then(function () {
-    document.getElementById("result").textContent = "QRコードをカメラにかざしてください";
-  }).catch(function () {
-    // facingMode指定で失敗 → カメラID指定でフォールバック
-    Html5Qrcode.getCameras().then(function (cams) {
-      if (cams && cams.length) {
-        var camId = cams[cams.length - 1].id; // 背面カメラを優先
-        scanner.start(camId, { fps: 15, aspectRatio: 1.0 }, onScan, function () {})
-          .then(function () {
-            document.getElementById("result").textContent = "QRコードをカメラにかざしてください";
-          })
-          .catch(function (e2) { showError(e2.name || "Error", e2.message || e2); });
-      } else {
-        showError("NotFoundError", "利用可能なカメラがありません");
-      }
-    }).catch(function (e3) { showError(e3.name || "Error", e3.message || e3); });
-  });
+    scanRAF = requestAnimationFrame(loop);
+  }
+  loop();
 }
 
 function boot() {
