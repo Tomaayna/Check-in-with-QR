@@ -1,0 +1,340 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>受付スキャン</title>
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: sans-serif; background: #0d1b2a; color: #fff; }
+  header { padding: 12px 16px; background: #1565c0; font-size: 16px; font-weight: bold; text-align: center; }
+  .counter { padding: 10px; text-align: center; font-size: 14px; background: #102a43; }
+  .counter b { font-size: 20px; color: #4fc3f7; }
+  #reader { width: 100%; max-width: 480px; margin: 0 auto; }
+  #result { margin: 0 auto; max-width: 480px; padding: 20px 16px; text-align: center; min-height: 120px; }
+  #result.ok { background: #1b5e20; }
+  #result.warn { background: #e65100; }
+  #result.error { background: #b71c1c; }
+  .rname { font-size: 26px; font-weight: bold; margin: 6px 0; }
+  .rmsg { font-size: 15px; opacity: .9; }
+  .rco { font-size: 14px; opacity: .8; }
+  #err { display: none; max-width: 480px; margin: 16px auto; padding: 16px; background: #b71c1c; border-radius: 10px; font-size: 14px; line-height: 1.6; }
+  #err ol { margin: 8px 0 0; padding-left: 20px; }
+  #retry { margin-top: 12px; border: none; background: #fff; color: #b71c1c; font-weight: bold; border-radius: 8px; padding: 10px 20px; font-size: 15px; cursor: pointer; }
+  #setup { max-width: 480px; margin: 24px auto; padding: 16px; background: #102a43; border-radius: 10px; font-size: 13px; line-height: 1.6; }
+  #setup input { width: 100%; padding: 8px; border-radius: 6px; border: none; font-size: 13px; margin-top: 6px; }
+  #setup button { margin-top: 10px; border: none; background: #1565c0; color: #fff; border-radius: 8px; padding: 10px 18px; font-size: 14px; cursor: pointer; }
+</style>
+</head>
+<body>
+<header>受付スキャン</header>
+<div class="counter">来場 <b id="cdone">-</b> / <span id="ctotal">-</span> 名</div>
+<div id="reader"></div>
+<div id="result">準備中…</div>
+<div id="err"></div>
+<div id="timing" style="max-width:480px;margin:12px auto;padding:12px;background:#000;color:#0ff;font-family:monospace;font-size:12px;line-height:1.6;border-radius:8px;white-space:pre-wrap;">[計測ログ]\nQRを読み取ると、認識〜サーバー応答までの時間(ms)を表示します。</div>
+
+<!-- API URL が未設定の場合に表示する設定欄 -->
+<div id="setup" style="display:none;">
+  <div>GASウェブアプリのURL(…/exec)を入力してください。一度設定すればこの端末に保存されます。</div>
+  <input id="apiInput" type="text" placeholder="https://script.google.com/macros/s/XXXX/exec">
+  <button id="apiSave">保存して開始</button>
+</div>
+
+<script>
+/* ============================================================
+ *  受付スキャン画面(GitHub Pages版)
+ *  通常は管理トップ画面の「受付スキャン」ボタンから開きます。
+ *  その際 GAS が ?api=ウェブアプリURL&key=合言葉 を付けて遷移するため、
+ *  このファイル(public)にウェブアプリURLを直接書く必要はありません。
+ *  一度開くと api/key はこの端末に保存され、次回はパラメータ無しでも動きます。
+ *
+ *  【QR認識精度について】
+ *  ネイティブの BarcodeDetector API が使える端末(iOS16+ Safari等)では
+ *  そちらを優先し、標準カメラアプリ並みの高精度・高速検出を行う。
+ *  非対応端末は html5-qrcode にフォールバック(高解像度・fps15で起動)。
+ * ============================================================ */
+var API_URL = ""; // ← ここにGASのウェブアプリURL(…/exec)を貼り付けてもOK
+var ADMIN_KEY = "tomasei-nasta-404510"; // 管理用の合言葉(?key= で渡される)
+
+// 優先順位: ①URLの ?api=/?key= パラメータ → ②保存済み(localStorage) → ③上の直書き
+(function () {
+  // ① URLクエリ ?api= / ?key= を読み取る
+  try {
+    var params = new URLSearchParams(window.location.search);
+    var fromQuery = params.get("api");
+    var keyQuery  = params.get("key");
+    if (fromQuery) {
+      API_URL = fromQuery.trim();
+      try { localStorage.setItem("checkin_api_url", API_URL); } catch (e) {}
+    }
+    if (keyQuery) {
+      ADMIN_KEY = keyQuery.trim();
+      try { localStorage.setItem("checkin_admin_key", ADMIN_KEY); } catch (e) {}
+    }
+    if (fromQuery) return; // api が来ていれば設定完了
+  } catch (e) {}
+  // ② 保存済みがあれば利用
+  if (!API_URL) {
+    try { API_URL = localStorage.getItem("checkin_api_url") || ""; } catch (e) {}
+  }
+  if (!ADMIN_KEY) {
+    try { ADMIN_KEY = localStorage.getItem("checkin_admin_key") || ""; } catch (e) {}
+  }
+})();
+
+var lastId = "", lastTime = 0, scanner = null;
+
+function tlog(msg) {
+  var el = document.getElementById("timing");
+  el.textContent += "\n" + msg;
+}
+
+/* GASへのPOST: CORSプリフライトを避けるため text/plain で送る */
+function callApi(body) {
+  body.key = ADMIN_KEY; // 合言葉を付与
+  var t0 = performance.now();
+  return fetch(API_URL, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=utf-8" },
+    body: JSON.stringify(body)
+  }).then(function (r) {
+    var t1 = performance.now();
+    tlog("通信(" + body.action + "): " + Math.round(t1 - t0) + " ms (HTTP " + r.status + ")");
+    return r.json();
+  });
+}
+
+// stats オブジェクトでカウンター表示を更新
+function updateCounter(stats) {
+  if (!stats) return;
+  document.getElementById("cdone").textContent = stats.done;
+  document.getElementById("ctotal").textContent = stats.total;
+}
+
+// 初回のみカウンターを取得(以降は checkin のレスポンスで更新するため定期取得しない)
+function refresh() {
+  if (!API_URL) return;
+  callApi({ action: "stats" }).then(function (d) {
+    if (d && d.ok) updateCounter(d.stats);
+  }).catch(function () {});
+}
+
+/* ===== 効果音(Web Audioでその場合成。音声ファイル不要)===== */
+var audioCtx = null;
+// iOSは初回ユーザー操作時にAudioContextを生成・再開する必要がある
+function initAudio() {
+  try {
+    if (!audioCtx) {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (AC) audioCtx = new AC();
+    }
+    if (audioCtx && audioCtx.state === "suspended") audioCtx.resume();
+  } catch (e) {}
+}
+// 単音を鳴らす(周波数Hz, 開始秒, 長さ秒, 音量)
+function tone(freq, start, dur, vol) {
+  if (!audioCtx) return;
+  var t0 = audioCtx.currentTime + start;
+  var osc = audioCtx.createOscillator();
+  var gain = audioCtx.createGain();
+  osc.type = "sine";
+  osc.frequency.value = freq;
+  gain.gain.setValueAtTime(0, t0);
+  gain.gain.linearRampToValueAtTime(vol, t0 + 0.01);     // 立ち上がり
+  gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur); // 減衰
+  osc.connect(gain).connect(audioCtx.destination);
+  osc.start(t0);
+  osc.stop(t0 + dur + 0.02);
+}
+// 成功音「ピロー↑ン」: 2音上昇、合計約1秒
+function beepOk()   { initAudio(); tone(880, 0, 0.3, 0.3); tone(1318, 0.28, 0.72, 0.3); }
+// 警告音(受付済み): 低めの2連
+function beepWarn() { initAudio(); tone(660, 0, 0.12, 0.25); tone(660, 0.16, 0.12, 0.25); }
+// エラー音: 下降
+function beepErr()  { initAudio(); tone(400, 0, 0.18, 0.25); tone(250, 0.16, 0.25, 0.25); }
+
+function show(res) {
+  var el = document.getElementById("result");
+  el.className = res.type;
+  el.innerHTML =
+    '<div class="rname">' + (res.name ? res.name + " 様" : "") + '</div>' +
+    '<div class="rmsg">' + res.title + " : " + res.message + '</div>' +
+    '<div class="rco">' + (res.company || "") + '</div>';
+  // 結果に応じて効果音
+  if (res.type === "ok") beepOk();
+  else if (res.type === "warn") beepWarn();
+  else beepErr();
+}
+
+function onScan(text) {
+  var now = Date.now();
+  var id = text;
+  // QRに ?id=XXX 入りURLが入っている場合はIDだけ取り出す
+  try {
+    if (text.indexOf("?id=") >= 0) {
+      id = decodeURIComponent(text.split("?id=")[1].split("&")[0]);
+    }
+  } catch (e) {}
+  // 同一IDの連続読み取りを1秒間抑止
+  if (id === lastId && now - lastTime < 1000) return;
+  lastId = id; lastTime = now;
+
+  tlog("---- QR認識: ID=" + id + " ----");
+  var tScan = performance.now();
+  callApi({ action: "checkin", id: id }).then(function (d) {
+    if (d && d.result) {
+      show(d.result);
+      updateCounter(d.stats);
+    }
+    tlog("認識→完了の合計: " + Math.round(performance.now() - tScan) + " ms");
+  }).catch(function (e) {
+    show({ type: "error", title: "通信エラー", message: "サーバーに接続できません", name: "", company: "" });
+    tlog("通信エラー: " + (e && e.message ? e.message : e));
+  });
+}
+
+function showError(name, detail) {
+  var permMsg =
+    (name === "NotAllowedError") ? "カメラの使用が許可されていません。" :
+    (name === "NotFoundError")   ? "カメラが見つかりませんでした。" :
+    (name === "NotReadableError")? "カメラを他のアプリが使用中です。" :
+    "カメラを起動できませんでした。";
+  document.getElementById("err").innerHTML =
+    "<b>" + permMsg + "</b>（" + detail + "）<ol>" +
+    "<li>アドレスバーのカメラ/鍵アイコンから、カメラを<b>「許可」</b>に変更してください。</li>" +
+    "<li>端末の設定（iPhone:設定→Safari／Android:設定→アプリ→Chrome）でカメラ権限を確認してください。</li>" +
+    "<li>他のカメラ使用アプリ（ビデオ通話等）を閉じてください。</li>" +
+    "</ol><button id='retry'>もう一度試す</button>";
+  document.getElementById("err").style.display = "block";
+  document.getElementById("retry").onclick = startScanner;
+}
+
+function startScanner() {
+  initAudio(); // iOS対策: ユーザー操作に連なるこのタイミングで音声を有効化
+  document.getElementById("err").style.display = "none";
+  document.getElementById("result").textContent = "カメラを起動しています…";
+  // ネイティブの BarcodeDetector が使えるならそちらを優先(標準カメラ並みの精度)
+  if ("BarcodeDetector" in window) {
+    startNativeDetector();
+    return;
+  }
+  // 非対応端末は html5-qrcode にフォールバック
+  if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+    navigator.mediaDevices.getUserMedia({ video: { facingMode: "environment" } })
+      .then(function (stream) {
+        stream.getTracks().forEach(function (t) { t.stop(); });
+        launchScanner();
+      })
+      .catch(function (e) { showError(e.name || "Error", e.message || e); });
+  } else {
+    launchScanner();
+  }
+}
+
+/* ===== ネイティブ BarcodeDetector による高精度スキャン ===== */
+var nativeVideo = null, nativeStream = null, nativeRAF = null;
+function startNativeDetector() {
+  var detector;
+  try {
+    detector = new BarcodeDetector({ formats: ["qr_code"] });
+  } catch (e) { launchScanner(); return; }
+
+  navigator.mediaDevices.getUserMedia({
+    video: { facingMode: "environment", width: { ideal: 1920 }, height: { ideal: 1080 } }
+  }).then(function (stream) {
+    nativeStream = stream;
+    var reader = document.getElementById("reader");
+    reader.innerHTML = "";
+    nativeVideo = document.createElement("video");
+    nativeVideo.setAttribute("playsinline", "true"); // iOSで全画面化させない
+    nativeVideo.setAttribute("muted", "true");
+    nativeVideo.style.width = "100%";
+    nativeVideo.srcObject = stream;
+    reader.appendChild(nativeVideo);
+    return nativeVideo.play();
+  }).then(function () {
+    document.getElementById("result").textContent = "QRコードをカメラにかざしてください";
+    var scanning = true;
+    function loop() {
+      if (!scanning) return;
+      detector.detect(nativeVideo).then(function (codes) {
+        if (codes && codes.length) {
+          onScan(codes[0].rawValue);
+        }
+      }).catch(function () {}).then(function () {
+        nativeRAF = requestAnimationFrame(loop);
+      });
+    }
+    loop();
+  }).catch(function (e) {
+    // ネイティブ起動失敗 → html5-qrcode にフォールバック
+    if (nativeStream) { nativeStream.getTracks().forEach(function (t) { t.stop(); }); nativeStream = null; }
+    if (e && (e.name === "NotAllowedError" || e.name === "NotFoundError" || e.name === "NotReadableError")) {
+      showError(e.name, e.message || e);
+    } else {
+      launchScanner();
+    }
+  });
+}
+
+function launchScanner() {
+  if (!scanner) scanner = new Html5Qrcode("reader");
+  // 高精度設定: qrboxを設けず映像全体を走査、fps向上、背面カメラを高解像度で要求
+  var config = {
+    fps: 15,
+    aspectRatio: 1.0,
+    videoConstraints: {
+      facingMode: "environment",
+      width:  { ideal: 1920 },
+      height: { ideal: 1080 }
+    }
+  };
+  scanner.start(
+    { facingMode: "environment" },
+    config,
+    onScan, function () {}
+  ).then(function () {
+    document.getElementById("result").textContent = "QRコードをカメラにかざしてください";
+  }).catch(function () {
+    // facingMode指定で失敗 → カメラID指定でフォールバック
+    Html5Qrcode.getCameras().then(function (cams) {
+      if (cams && cams.length) {
+        var camId = cams[cams.length - 1].id; // 背面カメラを優先
+        scanner.start(camId, { fps: 15, aspectRatio: 1.0 }, onScan, function () {})
+          .then(function () {
+            document.getElementById("result").textContent = "QRコードをカメラにかざしてください";
+          })
+          .catch(function (e2) { showError(e2.name || "Error", e2.message || e2); });
+      } else {
+        showError("NotFoundError", "利用可能なカメラがありません");
+      }
+    }).catch(function (e3) { showError(e3.name || "Error", e3.message || e3); });
+  });
+}
+
+function boot() {
+  if (!API_URL) {
+    // URL未設定 → 設定欄を表示
+    document.getElementById("result").textContent = "セットアップが必要です";
+    document.getElementById("setup").style.display = "block";
+    document.getElementById("apiSave").onclick = function () {
+      var v = document.getElementById("apiInput").value.trim();
+      if (!v) return;
+      API_URL = v;
+      try { localStorage.setItem("checkin_api_url", v); } catch (e) {}
+      document.getElementById("setup").style.display = "none";
+      startScanner();
+      refresh(); // 初回カウンター取得のみ
+    };
+    return;
+  }
+  startScanner();
+  refresh(); // 初回カウンター取得のみ(以降はスキャン毎に更新)
+}
+
+boot();
+</script>
+</body>
+</html>
