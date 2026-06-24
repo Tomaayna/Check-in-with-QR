@@ -167,7 +167,7 @@ function onScan(text) {
     }
   } catch (e) {}
   // 同一IDの連続読み取りを3秒間抑止
-  if (id === lastId && now - lastTime < 3000) return;
+  if (id === lastId && now - lastTime < 1000) return;
   lastId = id; lastTime = now;
 
   callApi({ action: "checkin", id: id }).then(function (d) {
