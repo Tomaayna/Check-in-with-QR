@@ -54,7 +54,7 @@
  *  非対応端末は jsQR(QR専用デコーダ)で読み取る。
  *  いずれも同一値を2フレーム連続で読めたら確定する誤読防止つき。
  * ============================================================ */
-var API_URL = ""; // ← ここにGASのウェブアプリURL(…/exec)を貼り付けてもOK
+var API_URL = "https://script.google.com/macros/s/AKfycbyPH7odavUyUGAdj33fNVCAbYjBRxNrPquDS7XYthbhdBd5IIxDfJ0yDYM26g-o_BE/exec"; // ← ここにGASのウェブアプリURL(…/exec)を貼り付けてもOK
 var ADMIN_KEY = "tomasei-nasta-404510"; // 管理用の合言葉(?key= で渡される)
 
 // 優先順位: ①URLの ?api=/?key= パラメータ → ②保存済み(localStorage) → ③上の直書き
@@ -84,6 +84,7 @@ var ADMIN_KEY = "tomasei-nasta-404510"; // 管理用の合言葉(?key= で渡さ
 })();
 
 var lastId = "";
+var cooldownUntil = 0; // QR処理後、次の読み取りを受け付けない期限(ms)
 
 /* GASへのPOST: CORSプリフライトを避けるため text/plain で送る */
 function callApi(body) {
@@ -179,10 +180,14 @@ function onScan(text) {
       id = decodeURIComponent(text.split("?id=")[1].split("&")[0]);
     }
   } catch (e) {}
+  // 読み取り間インターバル: 直前の処理から1秒間は次の読み取りを受け付けない
+  var now = Date.now();
+  if (now < cooldownUntil) return;
   // 同じQRが映り続けている間は1回だけ処理。
   // QRが一度画面から外れる(handleRawでlastIDがクリアされる)と再び処理可能。
   if (id === lastId) return;
   lastId = id;
+  cooldownUntil = now + 1000;
 
   callApi({ action: "checkin", id: id }).then(function (d) {
     if (d && d.result) {
