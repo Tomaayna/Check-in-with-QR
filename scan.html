@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>受付スキャン</title>
 <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
   * { box-sizing: border-box; }
   body { margin: 0; font-family: sans-serif; background: #0d1b2a; color: #fff; }
@@ -31,6 +32,13 @@
 <header>受付スキャン</header>
 <div class="counter">来場 <b id="cdone">-</b> / <span id="ctotal">-</span> 名</div>
 <div id="reader"></div>
+
+<!-- Googleログイン(受付操作にはスプレッドシート共有アカウントでのログインが必要) -->
+<div id="signin" style="display:none;max-width:480px;margin:24px auto;padding:20px 16px;background:#102a43;border-radius:10px;text-align:center;">
+  <div style="font-size:14px;margin-bottom:14px;">受付を開始するには、名簿の共有を受けているGoogleアカウントでログインしてください。</div>
+  <div id="gsiBtn" style="display:flex;justify-content:center;"></div>
+  <div id="signinMsg" style="font-size:12px;color:#ffab91;margin-top:10px;"></div>
+</div>
 <div id="result">準備中…</div>
 <div id="err"></div>
 
@@ -53,17 +61,24 @@
  *  ネイティブの BarcodeDetector が使える端末ではそちらを優先。
  *  非対応端末は jsQR(QR専用デコーダ)で読み取る。
  *  いずれも同一値を2フレーム連続で読めたら確定する誤読防止つき。
+ *
+ *  【アクセス制限】
+ *  受付操作にはGoogleログインが必須。許可されるのは名簿スプレッド
+ *  シートに共有されているアカウントのみ(GAS側で検証・共有設定と同期)。
+ *  OAuthクライアントIDは ?gcid= で受け取る(ダッシュボード経由で自動付与)。
  * ============================================================ */
 var API_URL = "https://script.google.com/macros/s/AKfycbyPH7odavUyUGAdj33fNVCAbYjBRxNrPquDS7XYthbhdBd5IIxDfJ0yDYM26g-o_BE/exec"; // ← ここにGASのウェブアプリURL(…/exec)を貼り付けてもOK
 var ADMIN_KEY = "tomasei-nasta-404510"; // 管理用の合言葉(?key= で渡される)
+var GOOGLE_CLIENT_ID = ""; // OAuthクライアントID(?gcid= で渡される)
+var idToken = ""; // Googleログインで取得するIDトークン(受付操作に必須)
 
-// 優先順位: ①URLの ?api=/?key= パラメータ → ②保存済み(localStorage) → ③上の直書き
+// 優先順位: ①URLの ?api=/?key=/?gcid= パラメータ → ②保存済み(localStorage) → ③上の直書き
 (function () {
-  // ① URLクエリ ?api= / ?key= を読み取る
   try {
     var params = new URLSearchParams(window.location.search);
     var fromQuery = params.get("api");
     var keyQuery  = params.get("key");
+    var gcidQuery = params.get("gcid");
     if (fromQuery) {
       API_URL = fromQuery.trim();
       try { localStorage.setItem("checkin_api_url", API_URL); } catch (e) {}
@@ -72,7 +87,11 @@ var ADMIN_KEY = "tomasei-nasta-404510"; // 管理用の合言葉(?key= で渡さ
       ADMIN_KEY = keyQuery.trim();
       try { localStorage.setItem("checkin_admin_key", ADMIN_KEY); } catch (e) {}
     }
-    if (fromQuery) return; // api が来ていれば設定完了
+    if (gcidQuery) {
+      GOOGLE_CLIENT_ID = gcidQuery.trim();
+      try { localStorage.setItem("checkin_gcid", GOOGLE_CLIENT_ID); } catch (e) {}
+    }
+    if (fromQuery && gcidQuery) return; // 両方来ていれば設定完了
   } catch (e) {}
   // ② 保存済みがあれば利用
   if (!API_URL) {
@@ -81,6 +100,9 @@ var ADMIN_KEY = "tomasei-nasta-404510"; // 管理用の合言葉(?key= で渡さ
   if (!ADMIN_KEY) {
     try { ADMIN_KEY = localStorage.getItem("checkin_admin_key") || ""; } catch (e) {}
   }
+  if (!GOOGLE_CLIENT_ID) {
+    try { GOOGLE_CLIENT_ID = localStorage.getItem("checkin_gcid") || ""; } catch (e) {}
+  }
 })();
 
 var lastId = "";
@@ -88,7 +110,8 @@ var cooldownUntil = 0; // QR処理後、次の読み取りを受け付けない�
 
 /* GASへのPOST: CORSプリフライトを避けるため text/plain で送る */
 function callApi(body) {
-  body.key = ADMIN_KEY; // 合言葉を付与
+  body.key = ADMIN_KEY;   // 合言葉(statsのダッシュボード互換用)
+  body.idToken = idToken; // GoogleログインのIDトークン(受付操作に必須)
   return fetch(API_URL, {
     method: "POST",
     headers: { "Content-Type": "text/plain;charset=utf-8" },
@@ -193,6 +216,15 @@ function onScan(text) {
     if (d && d.result) {
       show(d.result);
       if (d.result.type === "ok") incCounter(); // 新規受付のみ来場数を+1
+    } else if (d && d.error === "unauthorized") {
+      // 未ログイン or トークン期限切れ → 再ログインを促す
+      show({ type: "error", title: "ログインが必要です", message: "Googleログインの有効期限が切れました。再度ログインしてください。", name: "", company: "" });
+      showSignIn("セッションの有効期限が切れました。もう一度ログインしてください。");
+    } else if (d && d.error === "forbidden") {
+      show({ type: "error", title: "権限がありません",
+             message: (d.email || "このアカウント") + " には受付権限がありません。名簿の共有を受けたアカウントでログインしてください。",
+             name: "", company: "" });
+      showSignIn("別のアカウントでログインし直してください。");
     }
   }).catch(function (e) {
     show({ type: "error", title: "通信エラー", message: "サーバーに接続できません", name: "", company: "" });
@@ -323,6 +355,44 @@ function runJsQR() {
   loop();
 }
 
+/* ===== Googleログイン(GIS) ===== */
+function showSignIn(msg) {
+  document.getElementById("signin").style.display = "block";
+  document.getElementById("signinMsg").textContent = msg || "";
+  initGsi();
+}
+
+var gsiInited = false;
+function initGsi() {
+  if (gsiInited) return;
+  if (!GOOGLE_CLIENT_ID) {
+    document.getElementById("signinMsg").textContent =
+      "OAuthクライアントIDが未設定です。ダッシュボードの「受付スキャン」ボタンから開き直してください。";
+    return;
+  }
+  // gsiスクリプトの読込完了を待ってから初期化
+  if (!(window.google && google.accounts && google.accounts.id)) {
+    setTimeout(initGsi, 300);
+    return;
+  }
+  gsiInited = true;
+  google.accounts.id.initialize({
+    client_id: GOOGLE_CLIENT_ID,
+    callback: onGoogleCredential
+  });
+  google.accounts.id.renderButton(document.getElementById("gsiBtn"), {
+    theme: "filled_blue", size: "large", text: "signin_with", shape: "pill"
+  });
+}
+
+function onGoogleCredential(resp) {
+  if (!resp || !resp.credential) return;
+  idToken = resp.credential; // 以降のAPI呼び出しに添付される
+  document.getElementById("signin").style.display = "none";
+  startScanner();
+  refresh(); // 初回カウンター取得
+}
+
 function boot() {
   if (!API_URL) {
     // URL未設定 → 設定欄を表示
@@ -334,13 +404,13 @@ function boot() {
       API_URL = v;
       try { localStorage.setItem("checkin_api_url", v); } catch (e) {}
       document.getElementById("setup").style.display = "none";
-      startScanner();
-      refresh(); // 初回カウンター取得のみ
+      boot();
     };
     return;
   }
-  startScanner();
-  refresh(); // 初回カウンター取得のみ(以降はスキャン毎に更新)
+  // Googleログインしてからスキャン開始(受付操作にはログイン必須)
+  document.getElementById("result").textContent = "Googleログインをお願いします";
+  showSignIn("");
 }
 
 boot();
