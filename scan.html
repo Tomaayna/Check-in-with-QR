@@ -4,7 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>受付スキャン</title>
-<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+<!-- jsQRはBarcodeDetector非対応時のみ動的に読み込む(下部スクリプト参照)。
+     同期読み込みだと弱い電波でページ全体が白画面のまま固まるため外した。 -->
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
   * { box-sizing: border-box; }
@@ -17,6 +18,7 @@
   #result.ok { background: #1b5e20; }
   #result.warn { background: #e65100; }
   #result.error { background: #b71c1c; }
+  #result.pending { background: #37474f; }
   .rname { font-size: 26px; font-weight: bold; margin: 6px 0; }
   .rmsg { font-size: 15px; opacity: .9; }
   .rco { font-size: 14px; opacity: .8; }
@@ -41,6 +43,15 @@
 </div>
 <div id="result">準備中…</div>
 <div id="err"></div>
+
+<!-- 要確認リスト: 受付できなかった読み取りを氏名付きで蓄積表示(消えない) -->
+<div id="errlist" style="display:none;max-width:480px;margin:12px auto;padding:12px;background:#7f1d1d;border-radius:10px;">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+    <b style="font-size:15px;">要確認（<span id="errcount">0</span>件）</b>
+    <button id="errClearAll" style="border:none;background:#fff;color:#7f1d1d;font-weight:bold;border-radius:6px;padding:6px 12px;font-size:13px;cursor:pointer;">すべて確認済み</button>
+  </div>
+  <ul id="errItems" style="list-style:none;margin:0;padding:0;"></ul>
+</div>
 
 <!-- API URL が未設定の場合に表示する設定欄 -->
 <div id="setup" style="display:none;">
@@ -67,8 +78,8 @@
  *  シートに共有されているアカウントのみ(GAS側で検証・共有設定と同期)。
  *  OAuthクライアントIDは ?gcid= で受け取る(ダッシュボード経由で自動付与)。
  * ============================================================ */
-var API_URL = "https://script.google.com/macros/s/AKfycbyPH7odavUyUGAdj33fNVCAbYjBRxNrPquDS7XYthbhdBd5IIxDfJ0yDYM26g-o_BE/exec"; // ← ここにGASのウェブアプリURL(…/exec)を貼り付けてもOK
-var ADMIN_KEY = "tomasei-nasta-404510"; // 管理用の合言葉(?key= で渡される)
+var API_URL = ""; // ← ここにGASのウェブアプリURL(…/exec)を貼り付けてもOK
+var ADMIN_KEY = ""; // 管理用の合言葉(?key= で渡される)
 var GOOGLE_CLIENT_ID = ""; // OAuthクライアントID(?gcid= で渡される)
 var idToken = ""; // Googleログインで取得するIDトークン(受付操作に必須)
 
@@ -182,18 +193,64 @@ function beepWarn() { initAudio(); tone(660, 0, 0.12, 0.25); tone(660, 0.16, 0.1
 // エラー音: 下降
 function beepErr()  { initAudio(); tone(400, 0, 0.18, 0.25); tone(250, 0.16, 0.25, 0.25); }
 
-function show(res) {
+// 読み取り直後の「受付中」表示(応答を待たずに次へ進むための即時フィードバック)
+function showPending() {
   var el = document.getElementById("result");
-  el.className = res.type;
+  el.className = "pending";
+  el.innerHTML = '<div class="rmsg">受付中…</div>';
+}
+
+// 受付成功(緑・成功音)。流れてよい表示。
+function showSuccess(res) {
+  var el = document.getElementById("result");
+  el.className = "ok";
   el.innerHTML =
     '<div class="rname">' + (res.name ? res.name + " 様" : "") + '</div>' +
-    '<div class="rmsg">' + res.title + " : " + res.message + '</div>' +
+    '<div class="rmsg">受付完了</div>' +
     '<div class="rco">' + (res.company || "") + '</div>';
-  // 結果に応じて効果音
-  if (res.type === "ok") beepOk();
-  else if (res.type === "warn") beepWarn();
-  else beepErr();
+  beepOk();
 }
+
+// 要確認リストに1件追加(消えない・氏名付き・警告音)
+function addError(name, company, reason) {
+  errSeq++;
+  var box = document.getElementById("errlist");
+  var ul = document.getElementById("errItems");
+  var li = document.createElement("li");
+  li.id = "erritem-" + errSeq;
+  li.style.cssText = "display:flex;justify-content:space-between;align-items:center;gap:8px;padding:8px 4px;border-bottom:1px solid rgba(255,255,255,.15);";
+  var who = name ? (esc(name) + " 様" + (company ? " / " + esc(company) : "")) : "";
+  li.innerHTML =
+    '<div style="flex:1;">' +
+      (who ? '<div style="font-weight:bold;font-size:15px;">' + who + '</div>' : '') +
+      '<div style="font-size:13px;opacity:.9;">' + esc(reason) + '</div>' +
+    '</div>' +
+    '<button style="border:none;background:#fff;color:#7f1d1d;font-weight:bold;border-radius:6px;padding:6px 10px;font-size:12px;cursor:pointer;">確認</button>';
+  li.querySelector("button").onclick = function () {
+    li.parentNode.removeChild(li);
+    updateErrCount();
+  };
+  ul.appendChild(li);
+  box.style.display = "block";
+  updateErrCount();
+  beepErr();
+}
+
+function updateErrCount() {
+  var n = document.getElementById("errItems").children.length;
+  document.getElementById("errcount").textContent = n;
+  if (n === 0) document.getElementById("errlist").style.display = "none";
+}
+
+function esc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"]/g, function (m) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[m];
+  });
+}
+
+// 送信中/処理済みのIDを管理(二重送信防止)
+var inFlight = {};   // 送信中のID
+var errSeq = 0;      // 要確認リストの項目ID
 
 function onScan(text) {
   var id = text;
@@ -206,28 +263,39 @@ function onScan(text) {
   // 読み取り間インターバル: 直前の処理から1秒間は次の読み取りを受け付けない
   var now = Date.now();
   if (now < cooldownUntil) return;
-  // 同じQRが映り続けている間は1回だけ処理。
-  // QRが一度画面から外れる(handleRawでlastIDがクリアされる)と再び処理可能。
+  // 同じQRが映り続けている間は1回だけ処理。QRが外れると再び処理可能。
   if (id === lastId) return;
+  // 送信中の同一IDは二重に送らない
+  if (inFlight[id]) return;
   lastId = id;
   cooldownUntil = now + 1000;
+  inFlight[id] = true;
+
+  // 即座に「受付中」を表示して、応答を待たず次のスキャンを受け付ける(体感速度)
+  showPending();
 
   callApi({ action: "checkin", id: id }).then(function (d) {
+    delete inFlight[id];
     if (d && d.result) {
-      show(d.result);
-      if (d.result.type === "ok") incCounter(); // 新規受付のみ来場数を+1
+      if (d.result.type === "ok") {
+        showSuccess(d.result);   // 成功は流れてよい
+        incCounter();
+      } else {
+        // 受付済み・ID未登録など → 要確認リストに氏名付きで残す
+        addError(d.result.name, d.result.company, d.result.title + "：" + d.result.message);
+      }
     } else if (d && d.error === "unauthorized") {
-      // 未ログイン or トークン期限切れ → 再ログインを促す
-      show({ type: "error", title: "ログインが必要です", message: "Googleログインの有効期限が切れました。再度ログインしてください。", name: "", company: "" });
+      addError("", "", "ログインの有効期限切れ（ID " + id + "）");
       showSignIn("セッションの有効期限が切れました。もう一度ログインしてください。");
     } else if (d && d.error === "forbidden") {
-      show({ type: "error", title: "権限がありません",
-             message: (d.email || "このアカウント") + " には受付権限がありません。名簿の共有を受けたアカウントでログインしてください。",
-             name: "", company: "" });
+      addError("", "", (d.email || "このアカウント") + " に受付権限がありません");
       showSignIn("別のアカウントでログインし直してください。");
+    } else {
+      addError("", "", "不明な応答（ID " + id + "）");
     }
   }).catch(function (e) {
-    show({ type: "error", title: "通信エラー", message: "サーバーに接続できません", name: "", company: "" });
+    delete inFlight[id];
+    addError("", "", "通信エラー（ID " + id + "）サーバーに接続できません");
   });
 }
 
@@ -335,24 +403,51 @@ function runNative() {
 }
 
 // jsQR で走査(canvasに描画してピクセルを解析)
+// jsQRを必要時に動的読み込み(タイムアウト付き)。読み込めたら onready を呼ぶ。
+var jsqrLoading = false;
+function ensureJsQR(onready) {
+  if (typeof jsQR === "function") { onready(); return; }
+  if (jsqrLoading) { setTimeout(function () { ensureJsQR(onready); }, 200); return; }
+  jsqrLoading = true;
+  document.getElementById("result").textContent = "QRエンジンを読み込み中…";
+  var done = false;
+  var s = document.createElement("script");
+  s.src = "https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js";
+  var timer = setTimeout(function () {
+    if (done) return; done = true;
+    showError("Error", "QRエンジンの読み込みに失敗しました（電波が弱い可能性）。再試行してください。");
+  }, 12000); // 12秒で諦めて再試行を促す
+  s.onload = function () {
+    if (done) return; done = true; clearTimeout(timer);
+    onready();
+  };
+  s.onerror = function () {
+    if (done) return; done = true; clearTimeout(timer);
+    showError("Error", "QRエンジンを読み込めませんでした。電波状況を確認して再試行してください。");
+  };
+  document.head.appendChild(s);
+}
+
 function runJsQR() {
-  canvas = document.createElement("canvas");
-  cctx = canvas.getContext("2d", { willReadFrequently: true });
-  function loop() {
-    if (camVideo.readyState === camVideo.HAVE_ENOUGH_DATA && camVideo.videoWidth) {
-      var w = camVideo.videoWidth, h = camVideo.videoHeight;
-      // 解析負荷軽減のため最大640pxに縮小して読む
-      var scale = Math.min(1, 640 / Math.max(w, h));
-      var cw = Math.round(w * scale), ch = Math.round(h * scale);
-      canvas.width = cw; canvas.height = ch;
-      cctx.drawImage(camVideo, 0, 0, cw, ch);
-      var img = cctx.getImageData(0, 0, cw, ch);
-      var code = jsQR(img.data, cw, ch, { inversionAttempts: "dontInvert" });
-      if (code && code.data) handleRaw(code.data);
+  ensureJsQR(function () {
+    document.getElementById("result").textContent = "QRコードをカメラにかざしてください";
+    canvas = document.createElement("canvas");
+    cctx = canvas.getContext("2d", { willReadFrequently: true });
+    function loop() {
+      if (camVideo.readyState === camVideo.HAVE_ENOUGH_DATA && camVideo.videoWidth) {
+        var w = camVideo.videoWidth, h = camVideo.videoHeight;
+        var scale = Math.min(1, 640 / Math.max(w, h));
+        var cw = Math.round(w * scale), ch = Math.round(h * scale);
+        canvas.width = cw; canvas.height = ch;
+        cctx.drawImage(camVideo, 0, 0, cw, ch);
+        var img = cctx.getImageData(0, 0, cw, ch);
+        var code = jsQR(img.data, cw, ch, { inversionAttempts: "dontInvert" });
+        if (code && code.data) handleRaw(code.data);
+      }
+      scanRAF = requestAnimationFrame(loop);
     }
-    scanRAF = requestAnimationFrame(loop);
-  }
-  loop();
+    loop();
+  });
 }
 
 /* ===== Googleログイン(GIS) ===== */
@@ -362,7 +457,7 @@ function showSignIn(msg) {
   initGsi();
 }
 
-var gsiInited = false;
+var gsiInited = false, gsiTries = 0;
 function initGsi() {
   if (gsiInited) return;
   if (!GOOGLE_CLIENT_ID) {
@@ -370,12 +465,21 @@ function initGsi() {
       "OAuthクライアントIDが未設定です。ダッシュボードの「受付スキャン」ボタンから開き直してください。";
     return;
   }
-  // gsiスクリプトの読込完了を待ってから初期化
+  // gsiスクリプトの読込完了を待つ。約12秒(300ms×40回)で諦めて案内。
   if (!(window.google && google.accounts && google.accounts.id)) {
+    gsiTries++;
+    if (gsiTries > 40) {
+      document.getElementById("signinMsg").innerHTML =
+        "Googleログインを読み込めませんでした（電波が弱い可能性）。<br>" +
+        '<button onclick="location.reload()" style="margin-top:8px;border:none;background:#fff;color:#102a43;font-weight:bold;border-radius:6px;padding:8px 16px;cursor:pointer;">再読み込み</button>';
+      return;
+    }
+    document.getElementById("signinMsg").textContent = "Googleログインを準備中…";
     setTimeout(initGsi, 300);
     return;
   }
   gsiInited = true;
+  document.getElementById("signinMsg").textContent = "";
   google.accounts.id.initialize({
     client_id: GOOGLE_CLIENT_ID,
     callback: onGoogleCredential
@@ -412,6 +516,12 @@ function boot() {
   document.getElementById("result").textContent = "Googleログインをお願いします";
   showSignIn("");
 }
+
+// 「すべて確認済み」で要確認リストを一括クリア
+document.getElementById("errClearAll").onclick = function () {
+  document.getElementById("errItems").innerHTML = "";
+  updateErrCount();
+};
 
 boot();
 </script>
