@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>受付スキャン</title>
+<title>QRスキャン</title>
 <!-- jsQRはBarcodeDetector非対応時のみ動的に読み込む(下部スクリプト参照)。
      同期読み込みだと弱い電波でページ全体が白画面のまま固まるため外した。 -->
 <script src="https://accounts.google.com/gsi/client" async defer></script>
@@ -31,7 +31,7 @@
 </style>
 </head>
 <body>
-<header>受付スキャン</header>
+<header>QRスキャン</header>
 <div class="counter">来場 <b id="cdone">-</b> / <span id="ctotal">-</span> 名</div>
 <div id="reader"></div>
 
@@ -62,8 +62,8 @@
 
 <script>
 /* ============================================================
- *  受付スキャン画面(GitHub Pages版)
- *  通常は管理トップ画面の「受付スキャン」ボタンから開きます。
+ *  QRスキャン画面(GitHub Pages版)
+ *  通常は管理トップ画面の「QRスキャン」ボタンから開きます。
  *  その際 GAS が ?api=ウェブアプリURL&key=合言葉 を付けて遷移するため、
  *  このファイル(public)にウェブアプリURLを直接書く必要はありません。
  *  一度開くと api/key はこの端末に保存され、次回はパラメータ無しでも動きます。
@@ -462,7 +462,7 @@ function initGsi() {
   if (gsiInited) return;
   if (!GOOGLE_CLIENT_ID) {
     document.getElementById("signinMsg").textContent =
-      "OAuthクライアントIDが未設定です。ダッシュボードの「受付スキャン」ボタンから開き直してください。";
+      "OAuthクライアントIDが未設定です。ダッシュボードの「QRスキャン」ボタンから開き直してください。";
     return;
   }
   // gsiスクリプトの読込完了を待つ。約12秒(300ms×40回)で諦めて案内。
